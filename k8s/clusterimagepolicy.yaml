@@ -1,0 +1,15 @@
+# Rendered with envsubst in the e2e job.
+apiVersion: policy.sigstore.dev/v1beta1
+kind: ClusterImagePolicy
+metadata:
+  name: ecr-poc-signed
+spec:
+  mode: enforce
+  images:
+    - glob: "${ECR_REG}/${ECR_PREFIX}/apps/**"
+  authorities:
+    - name: vault-transit
+      key:
+        hashAlgorithm: sha256
+        data: |
+${COSIGN_PUBKEY_INDENTED}

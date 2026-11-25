@@ -1,0 +1,296 @@
+name: publish-and-verify
+
+# PoC of the ECR OCI design:
+#   ghcr.io stands in for Artifactory, a Vault dev server stands in for the in-house Vault,
+#   a kind cluster stands in for a Gardener shoot.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_REPLICA_REGION: ${{ vars.AWS_REPLICA_REGION }}
+  ECR_PREFIX: ${{ vars.ECR_PREFIX || 'poc' }}
+  ECR_REG: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
+  GHCR_IMG: ghcr.io/${{ github.repository }}/poc-app
+  GHCR_CHARTS: ghcr.io/${{ github.repository }}/charts
+  REGCTL_VERSION: v0.11.7
+  COSIGN_VERSION: v2.5.0
+  COSIGN_KEY: hashivault://cosign
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    services:
+      vault:
+        image: hashicorp/vault:1.18.1
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: root
+          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+          SKIP_SETCAP: "true"
+        ports:
+          - 8200:8200
+    env:
+      VAULT_ADDR: http://127.0.0.1:8200
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_ACTOR: ${{ github.actor }}
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      digest: ${{ steps.build.outputs.digest }}
+      chart_version: ${{ steps.meta.outputs.chart_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check repository variables
+        run: |
+          for v in AWS_ROLE_ARN AWS_ACCOUNT_ID AWS_REGION; do
+            [ -n "$(eval echo \$VAR_$v)" ] || { echo "::error::repository variable $v is not set (see README)"; exit 1; }
+          done
+        env:
+          VAR_AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          VAR_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          VAR_AWS_REGION: ${{ vars.AWS_REGION }}
+
+      - id: meta
+        run: |
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "chart_version=0.1.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Install regctl
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/regctl" \
+            "https://github.com/regclient/regclient/releases/download/${REGCTL_VERSION}/regctl-linux-amd64"
+          chmod +x "$HOME/bin/regctl"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      # Same Transit setup and policy as in the design (section 3.1).
+      # cosign gets a token limited to the cosign-sign policy, not the root token.
+      - name: Vault Transit key + signing token
+        run: |
+          for i in $(seq 1 30); do curl -fs "$VAULT_ADDR/v1/sys/health" >/dev/null && break; sleep 1; done
+          H="X-Vault-Token: root"
+          curl -fsS -H "$H" -X POST -d '{"type":"transit"}' "$VAULT_ADDR/v1/sys/mounts/transit"
+          curl -fsS -H "$H" -X POST -d '{"type":"ecdsa-p256"}' "$VAULT_ADDR/v1/transit/keys/cosign"
+          POLICY='path "transit/sign/cosign"   { capabilities = ["update"] }
+          path "transit/sign/cosign/*" { capabilities = ["update"] }
+          path "transit/keys/cosign"   { capabilities = ["read"] }'
+          jq -n --arg p "$POLICY" '{policy: $p}' \
+            | curl -fsS -H "$H" -X PUT -d @- "$VAULT_ADDR/v1/sys/policies/acl/cosign-sign"
+          TOKEN=$(curl -fsS -H "$H" -X POST -d '{"policies":["cosign-sign"],"ttl":"1h"}' \
+            "$VAULT_ADDR/v1/auth/token/create" | jq -r .auth.client_token)
+          echo "::add-mask::$TOKEN"
+          echo "VAULT_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.GHCR_IMG }}:${{ steps.meta.outputs.tag }}
+          provenance: false
+
+      - name: Sign image once (in ghcr = Artifactory stand-in)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes --tlog-upload=false --key "$COSIGN_KEY" "$GHCR_IMG@$DIGEST"
+          cosign public-key --key "$COSIGN_KEY" > cosign.pub
+          cat cosign.pub
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cosign-pub
+          path: cosign.pub
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 3600
+
+      - name: Registry logins
+        run: |
+          echo "$GH_TOKEN" | regctl registry login ghcr.io -u "$GH_ACTOR" --pass-stdin
+          aws ecr get-login-password | regctl registry login "$ECR_REG" -u AWS --pass-stdin
+          aws ecr get-login-password | cosign login "$ECR_REG" -u AWS --password-stdin
+
+      - name: Copy image + signature to ECR (regctl --digest-tags)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          DST="$ECR_REG/$ECR_PREFIX/apps/poc-app"
+          regctl image copy --digest-tags --referrers "$GHCR_IMG@$DIGEST" "$DST:$TAG"
+          test "$(regctl image digest "$DST:$TAG")" = "$DIGEST"
+          echo "tags in ECR:"; regctl tag ls "$DST"
+          cosign verify --key cosign.pub --insecure-ignore-tlog=true "$DST@$DIGEST" > /dev/null
+          echo "OK: copied signature verifies in ECR"
+
+      - name: Copy the same image WITHOUT signature (negative test)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          DST="$ECR_REG/$ECR_PREFIX/apps/poc-unsigned"
+          regctl image copy "$GHCR_IMG@$DIGEST" "$DST:$TAG"
+          if cosign verify --key cosign.pub --insecure-ignore-tlog=true "$DST@$DIGEST" >/dev/null 2>&1; then
+            echo "::error::unsigned copy unexpectedly verified"; exit 1
+          fi
+          echo "OK: unsigned copy does not verify"
+
+      - uses: azure/setup-helm@v4
+
+      - name: Helm chart – push to ghcr, sign, copy to ECR
+        env:
+          CHART_VERSION: ${{ steps.meta.outputs.chart_version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          helm package charts/poc-app --version "$CHART_VERSION" --app-version "$TAG"
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
+          helm push "poc-app-$CHART_VERSION.tgz" "oci://$GHCR_CHARTS" 2>&1 | tee push.log
+          CHART_DIGEST=$(grep -o 'sha256:[a-f0-9]\{64\}' push.log | head -1)
+          test -n "$CHART_DIGEST"
+          cosign sign --yes --tlog-upload=false --key "$COSIGN_KEY" "$GHCR_CHARTS/poc-app@$CHART_DIGEST"
+          DST="$ECR_REG/$ECR_PREFIX/helm/poc-app"
+          regctl image copy --digest-tags "$GHCR_CHARTS/poc-app@$CHART_DIGEST" "$DST:$CHART_VERSION"
+          test "$(regctl image digest "$DST:$CHART_VERSION")" = "$CHART_DIGEST"
+          cosign verify --key cosign.pub --insecure-ignore-tlog=true "$DST@$CHART_DIGEST" > /dev/null
+          echo "OK: chart and its signature are in ECR"
+
+      - name: Replication – signature reaches the replica region
+        if: env.AWS_REPLICA_REGION != ''
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+        run: |
+          SIG_TAG="sha256-${DIGEST#sha256:}.sig"
+          for i in $(seq 1 60); do
+            if aws ecr describe-images --region "$AWS_REPLICA_REGION" \
+                 --repository-name "$ECR_PREFIX/apps/poc-app" \
+                 --image-ids imageTag="$SIG_TAG" >/dev/null 2>&1; then
+              echo "signature tag replicated after ~$((i * 10))s"
+              REPLICA_REG="$ACCOUNT_ID.dkr.ecr.$AWS_REPLICA_REGION.amazonaws.com"
+              aws ecr get-login-password --region "$AWS_REPLICA_REGION" \
+                | cosign login "$REPLICA_REG" -u AWS --password-stdin
+              cosign verify --key cosign.pub --insecure-ignore-tlog=true \
+                "$REPLICA_REG/$ECR_PREFIX/apps/poc-app@$DIGEST" > /dev/null
+              echo "OK: signature verifies in $AWS_REPLICA_REGION"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::signature tag not replicated to $AWS_REPLICA_REGION within 10 minutes"
+          exit 1
+
+  e2e:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE_TAG: ${{ needs.publish.outputs.tag }}
+      CHART_VERSION: ${{ needs.publish.outputs.chart_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cosign-pub
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}-e2e
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: poc
+
+      - uses: azure/setup-helm@v4
+      - uses: fluxcd/flux2/action@main
+
+      # In the real setup ESO refreshes this secret every 6h (design 5.2).
+      - name: Namespaces + ECR pull secret
+        run: |
+          TOKEN=$(aws ecr get-login-password)
+          for ns in poc flux-system; do
+            kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f -
+            kubectl -n "$ns" create secret docker-registry ecr-pull \
+              --docker-server="$ECR_REG" --docker-username=AWS --docker-password="$TOKEN"
+          done
+          kubectl label namespace poc policy.sigstore.dev/include=true
+          kubectl -n poc patch serviceaccount default -p '{"imagePullSecrets":[{"name":"ecr-pull"}]}'
+
+      - name: Install Sigstore policy-controller + ClusterImagePolicy
+        run: |
+          helm repo add sigstore https://sigstore.github.io/helm-charts
+          helm install policy-controller sigstore/policy-controller \
+            -n cosign-system --create-namespace --wait --timeout 5m
+          export COSIGN_PUBKEY_INDENTED="$(sed 's/^/          /' cosign.pub)"
+          envsubst < k8s/clusterimagepolicy.yaml | tee /dev/stderr | kubectl apply -f -
+          sleep 15   # let the webhook pick up the policy
+
+      - name: "Admission: signed image from ECR is allowed"
+        run: |
+          kubectl -n poc run signed --image="$ECR_REG/$ECR_PREFIX/apps/poc-app:$IMAGE_TAG" --restart=Never
+          kubectl -n poc wait pod/signed --for=condition=Ready --timeout=180s
+          echo "OK: signed image admitted and pulled from ECR"
+
+      - name: "Admission: unsigned image is rejected"
+        run: |
+          if kubectl -n poc run unsigned \
+               --image="$ECR_REG/$ECR_PREFIX/apps/poc-unsigned:$IMAGE_TAG" --restart=Never 2> err.txt; then
+            echo "::error::unsigned image was admitted"; exit 1
+          fi
+          cat err.txt
+          echo "OK: unsigned image rejected"
+
+      - name: "Flux: verified chart from ECR is deployed"
+        run: |
+          flux install --components=source-controller,helm-controller
+          kubectl -n flux-system create secret generic cosign-pub --from-file=cosign.pub=cosign.pub
+          envsubst < k8s/flux.yaml | tee /dev/stderr | kubectl apply -f -
+          kubectl -n flux-system wait helmchart/flux-system-poc-app --for=condition=Ready --timeout=5m
+          VERIFIED=$(kubectl -n flux-system get helmchart flux-system-poc-app \
+            -o jsonpath='{.status.conditions[?(@.type=="SourceVerified")].status}')
+          echo "SourceVerified=$VERIFIED"; test "$VERIFIED" = "True"
+          kubectl -n flux-system wait helmrelease/poc-app --for=condition=Ready --timeout=5m
+          kubectl -n poc rollout status deployment/poc-app --timeout=3m
+          echo "OK: Flux verified the chart signature and deployed it"
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl -n poc get events --sort-by=.lastTimestamp || true
+          kubectl -n cosign-system logs -l app.kubernetes.io/name=policy-controller --tail=200 || true
+          flux get all -A || true
+          flux events -A || true

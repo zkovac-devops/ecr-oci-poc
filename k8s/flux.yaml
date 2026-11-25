@@ -1,0 +1,37 @@
+# Rendered with envsubst in the e2e job.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: ecr-charts
+  namespace: flux-system
+spec:
+  type: oci
+  url: oci://${ECR_REG}/${ECR_PREFIX}/helm
+  interval: 1m
+  secretRef:
+    name: ecr-pull
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: poc-app
+  namespace: flux-system
+spec:
+  interval: 1m
+  targetNamespace: poc
+  releaseName: poc-app
+  chart:
+    spec:
+      chart: poc-app
+      version: "${CHART_VERSION}"
+      sourceRef:
+        kind: HelmRepository
+        name: ecr-charts
+      verify:
+        provider: cosign
+        secretRef:
+          name: cosign-pub
+  values:
+    image:
+      repository: ${ECR_REG}/${ECR_PREFIX}/apps/poc-app
+      tag: "${IMAGE_TAG}"

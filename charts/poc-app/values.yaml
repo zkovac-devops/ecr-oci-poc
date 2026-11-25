@@ -1,0 +1,8 @@
+image:
+  repository: example.invalid/poc/apps/poc-app   # set by Flux HelmRelease values
+  tag: latest
+
+imagePullSecrets:
+  - name: ecr-pull
+
+replicaCount: 1

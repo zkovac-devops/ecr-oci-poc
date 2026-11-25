@@ -1,0 +1,6 @@
+apiVersion: v2
+name: poc-app
+description: ECR OCI PoC chart (version is set by the pipeline)
+type: application
+version: 0.0.0
+appVersion: "0.0.0"
