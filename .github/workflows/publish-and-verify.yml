@@ -286,6 +286,11 @@ jobs:
           flux install --components=source-controller,helm-controller
           kubectl -n flux-system create secret generic cosign-pub --from-file=cosign.pub=cosign.pub
           envsubst < k8s/flux.yaml | tee /dev/stderr | kubectl apply -f -
+          # helm-controller creates the HelmChart asynchronously – wait until it exists
+          for i in $(seq 1 60); do
+            kubectl -n flux-system get helmchart flux-system-poc-app >/dev/null 2>&1 && break
+            sleep 5
+          done
           kubectl -n flux-system wait helmchart/flux-system-poc-app --for=condition=Ready --timeout=5m
           VERIFIED=$(kubectl -n flux-system get helmchart flux-system-poc-app \
             -o jsonpath='{.status.conditions[?(@.type=="SourceVerified")].status}')
