@@ -101,10 +101,15 @@ data "aws_iam_policy_document" "trust" {
     }
 
     # PoC: any ref of this repo. Production restricts to main + release tags.
+    # GitHub may issue the sub claim with immutable IDs
+    # (repo:<owner>@<owner_id>/<repo>@<repo_id>:...), so both formats are accepted.
     condition {
       test     = "StringLike"
       variable = "${local.github_issuer}:sub"
-      values   = ["repo:${var.github_repo}:*"]
+      values = compact([
+        "repo:${var.github_repo}:*",
+        var.github_repo_with_ids != "" ? "repo:${var.github_repo_with_ids}:*" : "",
+      ])
     }
   }
 }

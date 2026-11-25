@@ -16,6 +16,12 @@ variable "github_repo" {
   default     = "zkovac-devops/ecr-oci-poc"
 }
 
+variable "github_repo_with_ids" {
+  description = "owner@owner_id/repo@repo_id as it appears in the OIDC sub claim when GitHub uses immutable IDs. Empty string disables it."
+  type        = string
+  default     = "zkovac-devops@17102879/ecr-oci-poc@1471640445"
+}
+
 variable "prefix" {
   description = "Prefix for all ECR repositories of this PoC"
   type        = string
