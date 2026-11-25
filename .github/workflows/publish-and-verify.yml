@@ -116,7 +116,13 @@ jobs:
           helm install policy-controller sigstore/policy-controller \
             -n cosign-system --create-namespace --wait --timeout 5m
           export COSIGN_PUBKEY_INDENTED="$(sed 's/^/          /' cosign.pub)"
-          envsubst < k8s/clusterimagepolicy.yaml | tee /dev/stderr | kubectl apply -f -
+          envsubst < k8s/clusterimagepolicy.yaml > cip.yaml && cat cip.yaml
+          # helm --wait only waits for the pod; the webhook needs a moment to publish its certs
+          for i in $(seq 1 24); do
+            kubectl apply -f cip.yaml && break
+            echo "webhook not ready yet, retrying in 5s ($i/24)"; sleep 5
+          done
+          kubectl get clusterimagepolicy ecr-poc-signed
           sleep 15   # let the webhook pick up the policy
 
       - name: "Admission: signed image from ECR is allowed"
