@@ -11,7 +11,13 @@ End-to-end test of the **AWS ECR as an OCI registry** design on github.com, befo
 
 ## What the pipeline proves
 
-`.github/workflows/publish-and-verify.yml`, job **publish**:
+The build runs in a **reusable workflow** (`.github/workflows/reusable-publish.yml`). `publish-and-verify.yml` calls it the same way 40–50 application repositories would call a central workflow.
+
+- Only jobs running the reusable workflow can assume the **push role**. The OIDC `sub` claim contains `job_workflow_ref` (repository OIDC subject template) and the trust policy matches it. Job **trust-negative** proves that any other job is denied.
+- The ECR repository `poc/apps/<repository name>` is **created on first push** from an ECR repository creation template (`CREATE_ON_PUSH`). Terraform does not list application repositories.
+- The **e2e** job uses a separate read-only **pull role**.
+
+Reusable workflow `reusable-publish.yml`:
 
 1. Builds a multi-arch image (amd64 + arm64) and pushes it to ghcr.
 2. Signs it **once** with cosign via **Vault Transit** (`hashivault://cosign`), using a token limited to the `cosign-sign` policy from the design. No upload to the public Rekor (`--tlog-upload=false`).
@@ -68,7 +74,7 @@ terraform init
 terraform apply
 ```
 
-It creates: the GitHub OIDC provider, 3 ECR repositories under `poc/`, replication `eu-central-1 → eu-west-1` for `poc/`, a repository creation template in the replica region, and the IAM role `gha-ecr-oci-poc` (trust limited to this repository).
+It creates: the GitHub OIDC provider, 2 ECR test repositories under `poc/` (unsigned image, Helm chart), a `CREATE_ON_PUSH` template for `poc` in the primary region, replication `eu-central-1 → eu-west-1` for `poc/` with a `REPLICATION` template in the replica region, the push role `gha-ecr-oci-poc` (only the reusable workflow) and the read-only pull role `gha-ecr-oci-poc-pull`.
 
 ### 2. Repository variables (no secrets needed)
 
@@ -78,9 +84,25 @@ It creates: the GitHub OIDC provider, 3 ECR repositories under `poc/`, replicati
 terraform output -raw github_variables
 ```
 
-They set `AWS_ROLE_ARN`, `AWS_ACCOUNT_ID`, `AWS_REGION`, `AWS_REPLICA_REGION`, `ECR_PREFIX`. You can also set them in **Settings → Secrets and variables → Actions → Variables**.
+They set `AWS_ROLE_ARN`, `AWS_PULL_ROLE_ARN`, `AWS_ACCOUNT_ID`, `AWS_REGION`, `AWS_REPLICA_REGION`, `ECR_PREFIX`. You can also set them in **Settings → Secrets and variables → Actions → Variables**.
 
-### 3. Run
+### 3. OIDC subject template (once per repository)
+
+The push role only trusts `sub` values that contain `job_workflow_ref`. Set the repository's OIDC subject template (needs repo admin). In production the same call exists for the whole org: `orgs/<org>/actions/oidc/customization/sub`.
+
+```bash
+gh api -X PUT repos/zkovac-devops/ecr-oci-poc/actions/oidc/customization/sub -F use_default=false -f 'include_claim_keys[]=repo' -f 'include_claim_keys[]=context' -f 'include_claim_keys[]=job_workflow_ref'
+```
+
+Check it:
+
+```bash
+gh api repos/zkovac-devops/ecr-oci-poc/actions/oidc/customization/sub
+```
+
+The step **Show OIDC token claims** prints the resulting `sub` in every run.
+
+### 4. Run
 
 Push to `main` or run the workflow manually (**Actions → publish-and-verify → Run workflow**).
 

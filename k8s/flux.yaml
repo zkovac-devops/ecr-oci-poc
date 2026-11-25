@@ -33,5 +33,5 @@ spec:
           name: cosign-pub
   values:
     image:
-      repository: ${ECR_REG}/${ECR_PREFIX}/apps/poc-app
+      repository: ${ECR_REG}/${IMAGE_REPO}
       tag: "${IMAGE_TAG}"

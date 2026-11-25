@@ -1,0 +1,246 @@
+name: reusable-publish
+
+# Reusable workflow that every application repository calls.
+# Only jobs running THIS file can assume the ECR push role
+# (trust policy matches job_workflow_ref in the OIDC sub claim).
+#
+# The ECR repository name is derived from the calling repository
+# and is deliberately NOT an input, so repo A cannot push into repo B's ECR repository.
+
+on:
+  workflow_call:
+    inputs:
+      image-context:
+        description: Docker build context
+        type: string
+        default: app
+      chart-path:
+        description: Path to the Helm chart
+        type: string
+        default: charts/poc-app
+    outputs:
+      tag:
+        value: ${{ jobs.publish.outputs.tag }}
+      digest:
+        value: ${{ jobs.publish.outputs.digest }}
+      chart_version:
+        value: ${{ jobs.publish.outputs.chart_version }}
+      image_repo:
+        value: ${{ jobs.publish.outputs.image_repo }}
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_REPLICA_REGION: ${{ vars.AWS_REPLICA_REGION }}
+  ECR_PREFIX: ${{ vars.ECR_PREFIX || 'poc' }}
+  ECR_REG: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
+  GHCR_IMG: ghcr.io/${{ github.repository }}/poc-app
+  GHCR_CHARTS: ghcr.io/${{ github.repository }}/charts
+  REGCTL_VERSION: v0.11.7
+  COSIGN_VERSION: v2.5.0
+  COSIGN_KEY: hashivault://cosign
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    services:
+      vault:
+        image: hashicorp/vault:1.18.1
+        env:
+          VAULT_DEV_ROOT_TOKEN_ID: root
+          VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+          SKIP_SETCAP: "true"
+        ports:
+          - 8200:8200
+    env:
+      VAULT_ADDR: http://127.0.0.1:8200
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_ACTOR: ${{ github.actor }}
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      digest: ${{ steps.build.outputs.digest }}
+      chart_version: ${{ steps.meta.outputs.chart_version }}
+      image_repo: ${{ steps.meta.outputs.image_repo }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check repository variables
+        run: |
+          for v in AWS_ROLE_ARN AWS_ACCOUNT_ID AWS_REGION; do
+            [ -n "$(eval echo \$VAR_$v)" ] || { echo "::error::repository variable $v is not set (see README)"; exit 1; }
+          done
+        env:
+          VAR_AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          VAR_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          VAR_AWS_REGION: ${{ vars.AWS_REGION }}
+
+      # ECR repository = <prefix>/apps/<calling repository name>; not overridable by the caller.
+      - id: meta
+        run: |
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "chart_version=0.1.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "image_repo=${ECR_PREFIX}/apps/${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Install regctl
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/regctl" \
+            "https://github.com/regclient/regclient/releases/download/${REGCTL_VERSION}/regctl-linux-amd64"
+          chmod +x "$HOME/bin/regctl"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      # Same Transit setup and policy as in the design (section 3.1).
+      - name: Vault Transit key + signing token
+        run: |
+          for i in $(seq 1 30); do curl -fs "$VAULT_ADDR/v1/sys/health" >/dev/null && break; sleep 1; done
+          H="X-Vault-Token: root"
+          curl -fsS -H "$H" -X POST -d '{"type":"transit"}' "$VAULT_ADDR/v1/sys/mounts/transit"
+          curl -fsS -H "$H" -X POST -d '{"type":"ecdsa-p256"}' "$VAULT_ADDR/v1/transit/keys/cosign"
+          POLICY='path "transit/sign/cosign"   { capabilities = ["update"] }
+          path "transit/sign/cosign/*" { capabilities = ["update"] }
+          path "transit/keys/cosign"   { capabilities = ["read"] }'
+          jq -n --arg p "$POLICY" '{policy: $p}' \
+            | curl -fsS -H "$H" -X PUT -d @- "$VAULT_ADDR/v1/sys/policies/acl/cosign-sign"
+          TOKEN=$(curl -fsS -H "$H" -X POST -d '{"policies":["cosign-sign"],"ttl":"1h"}' \
+            "$VAULT_ADDR/v1/auth/token/create" | jq -r .auth.client_token)
+          echo "::add-mask::$TOKEN"
+          echo "VAULT_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.image-context }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.GHCR_IMG }}:${{ steps.meta.outputs.tag }}
+          provenance: false
+
+      - name: Sign image once (in ghcr = Artifactory stand-in)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes --tlog-upload=false --key "$COSIGN_KEY" "$GHCR_IMG@$DIGEST"
+          cosign public-key --key "$COSIGN_KEY" > cosign.pub
+          cat cosign.pub
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cosign-pub
+          path: cosign.pub
+
+      # Prints only the claims AWS checks in the trust policy, never the token itself.
+      - name: Show OIDC token claims
+        run: |
+          curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
+            | jq -r .value \
+            | python3 -c 'import sys,json,base64; p=sys.stdin.read().split(".")[1]; c=json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4))); print(json.dumps({k:c.get(k) for k in ("iss","aud","sub","repository","ref","job_workflow_ref","event_name")}, indent=2))'
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 3600
+
+      - name: Registry logins
+        run: |
+          echo "$GH_TOKEN" | regctl registry login ghcr.io -u "$GH_ACTOR" --pass-stdin
+          aws ecr get-login-password | regctl registry login "$ECR_REG" -u AWS --pass-stdin
+          aws ecr get-login-password | cosign login "$ECR_REG" -u AWS --password-stdin
+
+      - name: Copy image + signature to ECR (create-on-push)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          IMAGE_REPO: ${{ steps.meta.outputs.image_repo }}
+        run: |
+          if aws ecr describe-repositories --repository-names "$IMAGE_REPO" >/dev/null 2>&1; then
+            echo "ECR repository $IMAGE_REPO already exists"
+          else
+            echo "ECR repository $IMAGE_REPO does not exist yet – expecting create-on-push"
+          fi
+          DST="$ECR_REG/$IMAGE_REPO"
+          regctl image copy --digest-tags --referrers "$GHCR_IMG@$DIGEST" "$DST:$TAG"
+          test "$(regctl image digest "$DST:$TAG")" = "$DIGEST"
+          echo "repository settings (from the CREATE_ON_PUSH template):"
+          aws ecr describe-repositories --repository-names "$IMAGE_REPO" \
+            --query 'repositories[0].{name:repositoryName,mutability:imageTagMutability,exclusions:imageTagMutabilityExclusionFilters,encryption:encryptionConfiguration.encryptionType,created:createdAt}'
+          echo "tags in ECR:"; regctl tag ls "$DST"
+          cosign verify --key cosign.pub --insecure-ignore-tlog=true "$DST@$DIGEST" > /dev/null
+          echo "OK: copied signature verifies in ECR"
+
+      - name: Copy the same image WITHOUT signature (negative test)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          DST="$ECR_REG/$ECR_PREFIX/apps/poc-unsigned"
+          regctl image copy "$GHCR_IMG@$DIGEST" "$DST:$TAG"
+          if cosign verify --key cosign.pub --insecure-ignore-tlog=true "$DST@$DIGEST" >/dev/null 2>&1; then
+            echo "::error::unsigned copy unexpectedly verified"; exit 1
+          fi
+          echo "OK: unsigned copy does not verify"
+
+      - uses: azure/setup-helm@v4
+
+      - name: Helm chart – push to ghcr, sign, copy to ECR
+        env:
+          CHART_VERSION: ${{ steps.meta.outputs.chart_version }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          CHART_PATH: ${{ inputs.chart-path }}
+        run: |
+          CHART_NAME=$(basename "$CHART_PATH")
+          helm package "$CHART_PATH" --version "$CHART_VERSION" --app-version "$TAG"
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
+          helm push "$CHART_NAME-$CHART_VERSION.tgz" "oci://$GHCR_CHARTS" 2>&1 | tee push.log
+          CHART_DIGEST=$(grep -o 'sha256:[a-f0-9]\{64\}' push.log | head -1)
+          test -n "$CHART_DIGEST"
+          cosign sign --yes --tlog-upload=false --key "$COSIGN_KEY" "$GHCR_CHARTS/$CHART_NAME@$CHART_DIGEST"
+          DST="$ECR_REG/$ECR_PREFIX/helm/$CHART_NAME"
+          regctl image copy --digest-tags "$GHCR_CHARTS/$CHART_NAME@$CHART_DIGEST" "$DST:$CHART_VERSION"
+          test "$(regctl image digest "$DST:$CHART_VERSION")" = "$CHART_DIGEST"
+          cosign verify --key cosign.pub --insecure-ignore-tlog=true "$DST@$CHART_DIGEST" > /dev/null
+          echo "OK: chart and its signature are in ECR"
+
+      - name: Replication – signature reaches the replica region
+        if: env.AWS_REPLICA_REGION != ''
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          IMAGE_REPO: ${{ steps.meta.outputs.image_repo }}
+        run: |
+          SIG_TAG="sha256-${DIGEST#sha256:}.sig"
+          for i in $(seq 1 60); do
+            if aws ecr describe-images --region "$AWS_REPLICA_REGION" \
+                 --repository-name "$IMAGE_REPO" \
+                 --image-ids imageTag="$SIG_TAG" >/dev/null 2>&1; then
+              echo "signature tag replicated after ~$((i * 10))s"
+              REPLICA_REG="$ACCOUNT_ID.dkr.ecr.$AWS_REPLICA_REGION.amazonaws.com"
+              aws ecr get-login-password --region "$AWS_REPLICA_REGION" \
+                | cosign login "$REPLICA_REG" -u AWS --password-stdin
+              cosign verify --key cosign.pub --insecure-ignore-tlog=true \
+                "$REPLICA_REG/$IMAGE_REPO@$DIGEST" > /dev/null
+              echo "OK: signature verifies in $AWS_REPLICA_REGION"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::signature tag not replicated to $AWS_REPLICA_REGION within 10 minutes"
+          exit 1

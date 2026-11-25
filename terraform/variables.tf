@@ -43,3 +43,9 @@ variable "manage_replication" {
   type        = bool
   default     = true
 }
+
+variable "publish_workflow_file" {
+  description = "File name of the reusable workflow that may assume the push role"
+  type        = string
+  default     = "reusable-publish.yml"
+}
