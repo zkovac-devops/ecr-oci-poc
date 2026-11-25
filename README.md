@@ -28,6 +28,13 @@ Job **e2e** (kind cluster):
 10. A pod with the **unsigned** image is **rejected** at admission.
 11. Installs **Flux**, which pulls the chart from ECR (`HelmRepository type: oci`), **verifies its cosign signature** (`SourceVerified=True`) and deploys it. The deployment's pod passes policy-controller too.
 
+## Documentation (Hugo)
+
+Hugo page bundles, ready to copy into the `content/` folder of a Hugo site:
+
+- [`docs/content/docs/ecr-oci-registry/index.md`](docs/content/docs/ecr-oci-registry/index.md) – design: AWS ECR as an OCI registry
+- [`docs/content/docs/ecr-oci-poc-report/index.md`](docs/content/docs/ecr-oci-poc-report/index.md) – PoC report: AWS inventory, pipeline walkthrough, findings, references
+
 ## Setup
 
 ### 1. AWS (test account)
