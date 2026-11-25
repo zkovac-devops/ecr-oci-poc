@@ -21,6 +21,7 @@ weight: 10
 | Helm | OCI in both registries: `helm push` to Artifactory, then the same `regctl` copy to ECR as for images. Consumers: Flux (`HelmRepository type: oci`) and helm CLI |
 | Auth CI → AWS | GHES OIDC (`https://github.tools.sap/_services/token`) → `AssumeRoleWithWebIdentity`, 1h session |
 | Auth clusters → ECR | ESO `ECRAuthorizationToken` via the shoot's OIDC issuer (~30 shoots). Token valid for 12 h, refreshed every 6 h |
+| Many repositories | One push role usable only from the reusable workflow (`job_workflow_ref` in `sub`), ECR repositories **created on first push** ([4.1](#41-rolling-out-to-4050-repositories-reusable-workflows)) |
 | Pull-through | ECR **cannot** proxy Artifactory. 3rd-party images go through a curated mirror (`mirror/`) |
 | Signatures | **cosign** with a key in **Vault Transit** (`hashivault://cosign`), no upload to the public Rekor |
 | Verification | Charts: **Flux natively** (`verify.provider: cosign`). Images: **Sigstore policy-controller** (small admission webhook, cosign only) |
@@ -585,6 +586,89 @@ Pipeline notes:
 - **A copied signature stays valid.** A cosign signature is bound to the digest, not to the registry name. The `Verify signature in ECR` step checks this on every run.
 - **ECR replication** carries the signature tags to the other regions like regular tags. The `sha256-*` immutability exception in Terraform allows adding another signature later (e.g. during key rotation).
 - For more applications, the jobs become a `matrix` or a reusable workflow (`workflow_call`) in a central repo.
+
+### 4.1 Rolling out to 40–50 repositories (reusable workflows)
+
+Image and chart builds already run in reusable workflows shared by 40–50 repositories in the GHES org. The goal is that **adding a new repository needs no change in AWS**.
+
+**One push role for the whole org, usable only from the reusable workflow.**
+
+- The GitHub OIDC token carries `job_workflow_ref`, e.g. `<org>/ci-workflows/.github/workflows/build-image.yml@refs/tags/v2`.
+- AWS IAM can only evaluate `aud` and `sub` for this provider; custom claims are not supported. The **OIDC subject template** puts `job_workflow_ref` into `sub` instead:
+
+  ```bash
+  gh api --hostname github.tools.sap -X PUT orgs/<org>/actions/oidc/customization/sub -f 'include_claim_keys[]=repo' -f 'include_claim_keys[]=context' -f 'include_claim_keys[]=job_workflow_ref'
+  ```
+
+- The resulting `sub` looks like `repo:<org>/app-x:ref:refs/heads/main:job_workflow_ref:<org>/ci-workflows/.github/workflows/build-image.yml@refs/tags/v2` (verify the exact form by printing the claims once).
+- Trust policy of the push role:
+
+  ```hcl
+  condition {
+    test     = "StringLike"
+    variable = "${local.ghes_issuer}:sub"
+    values = [
+      "repo:${local.gh_org}/*:*:job_workflow_ref:${local.gh_org}/ci-workflows/.github/workflows/build-image.yml@refs/tags/v*",
+      "repo:${local.gh_org}/*:*:job_workflow_ref:${local.gh_org}/ci-workflows/.github/workflows/build-chart.yml@refs/tags/v*",
+    ]
+  }
+  ```
+
+- Effect: any repository of the org can push, but **only through the approved workflow at a release tag**. A copied or modified workflow in a PR does not get the role.
+
+> **Caution:** an org-level subject template changes `sub` for **every** OIDC token in the org. Anything that matches on `sub` today (Vault JWT roles with `bound_subject`, other AWS roles) breaks. Audit first, or set the template per repository (`PUT repos/{owner}/{repo}/actions/oidc/customization/sub`, scriptable for 50 repos). New repositories may also get the ID-based format (`<org>@<id>/<repo>@<id>`); cover both in the trust policy until verified.
+
+**Repositories created on first push.**
+
+- ECR creates a repository on the first push when a repository creation template with `applied_for = CREATE_ON_PUSH` matches its prefix. Without a matching template nothing is created, so default settings never appear by accident.
+- Templates for `apps` and `helm` carry immutability (with the `sha256-*` exception), encryption, lifecycle and the repository policy. Replication rules filter by prefix, so new repositories replicate automatically.
+- The push role additionally needs `ecr:CreateRepository` on `apps/*` and `helm/*`.
+
+```hcl
+resource "aws_ecr_repository_creation_template" "create_on_push" {
+  for_each             = toset(["apps", "helm"])
+  prefix               = each.key
+  applied_for          = ["CREATE_ON_PUSH"]
+  image_tag_mutability = "IMMUTABLE_WITH_EXCLUSION"
+
+  image_tag_mutability_exclusion_filter {
+    filter      = "sha256-*"
+    filter_type = "WILDCARD"
+  }
+
+  encryption_configuration { encryption_type = "AES256" }
+  lifecycle_policy = local.lifecycle
+}
+```
+
+**Naming and isolation.**
+
+- The reusable workflow **derives** the ECR repository from `github.repository` (`apps/<repo>`, or `apps/<repo>/<image>` for several images; `helm/<chart>`). It must not be an input, otherwise repository A could push into `apps/B`.
+- With one role, the isolation between repositories relies on the workflow code plus immutable tags. If hard isolation is required, generate **one role per repository** with a Terraform module (`for_each`), each with its own `sub` and `apps/<repo>`; the cost is an onboarding step per repository. Session tags, which would do this more elegantly, are not available from GitHub OIDC tokens.
+- The pull side does not change: `k8s-ecr-pull` reads `apps/*` and `helm/*`.
+
+**Changes in the workflows and the repositories.**
+
+- Central repo: ECR steps behind an input `publish-ecr` (default `false` for a gradual rollout); role ARN, registry and region as **org-level variables**; callers reference the workflow by **tag** (`@v2`), which the trust policy matches.
+- Each calling repository must grant the OIDC permission, because a reusable workflow cannot get more permissions than its caller:
+
+  ```yaml
+  permissions:
+    contents: read
+    id-token: write
+  ```
+
+  If repositories already read Vault via `vault-action` with JWT auth, this is already in place.
+
+| Step | What |
+|---|---|
+| 1 | Terraform: push role with `job_workflow_ref` trust, `CREATE_ON_PUSH` templates, `ecr:CreateRepository` |
+| 2 | Audit what in the org depends on the `sub` format; decide org-level or per-repository subject template |
+| 3 | Reusable workflow `v2` with ECR steps behind `publish-ecr` |
+| 4 | Pilot on 2–3 repositories: check `sub`, create-on-push and replication |
+| 5 | Default `publish-ecr: true`, bulk bump of the workflow version (+ `id-token: write` where missing) |
+
+> **PoC:** tested in `zkovac-devops/ecr-oci-poc` with a repository-level subject template, see the [PoC report](../ecr-oci-poc-report/).
 
 ## 5. Kubernetes (Gardener shoots)
 
