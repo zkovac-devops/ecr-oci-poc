@@ -8,7 +8,7 @@ toc: true
 weight: 20
 ---
 
-> **Result:** passed on 2026-11-25. Run [45613631712](https://github.com/zkovac-devops/ecr-oci-poc/actions/runs/45613631712), repository [zkovac-devops/ecr-oci-poc](https://github.com/zkovac-devops/ecr-oci-poc).
+> **Result:** passed on 2026-11-25. Base run [45613631712](https://github.com/zkovac-devops/ecr-oci-poc/actions/runs/45613631712); reusable workflow + create-on-push run [45688988329](https://github.com/zkovac-devops/ecr-oci-poc/actions/runs/45688988329). Repository [zkovac-devops/ecr-oci-poc](https://github.com/zkovac-devops/ecr-oci-poc).
 > **Design:** [AWS ECR as an OCI registry](../ecr-oci-registry/).
 
 ## Summary
@@ -24,6 +24,10 @@ weight: 20
 | policy-controller admits the signed image from ECR | passed, pod pulled from ECR |
 | policy-controller rejects the unsigned image | passed |
 | Flux verifies the chart signature and deploys it | passed, `SourceVerified=True` |
+| Push role usable **only** from the reusable workflow (`job_workflow_ref` in `sub`) | passed |
+| A job outside the reusable workflow is denied the push role | passed (`Not authorized to perform sts:AssumeRoleWithWebIdentity`) |
+| ECR repository `poc/apps/ecr-oci-poc` **created on first push** with the template settings | passed (`IMMUTABLE_WITH_EXCLUSION`, AES256) |
+| e2e uses a separate read-only pull role | passed |
 
 How the production components were replaced in the PoC:
 
@@ -39,14 +43,17 @@ How the production components were replaced in the PoC:
 
 All resources are in account **`724875924481`**.
 
-### 1.1 Managed by Terraform (8 resources)
+### 1.1 Managed by Terraform
+
+State after the reusable-workflow test (the first run used `poc/apps/poc-app` from Terraform; it was removed when create-on-push was introduced).
 
 | # | Resource | Region | Key settings |
 |---|---|---|---|
 | 1 | IAM OIDC provider `token.actions.githubusercontent.com` | global | audience `sts.amazonaws.com` |
-| 2 | IAM role `gha-ecr-oci-poc` | global | trusts only this OIDC provider; `aud = sts.amazonaws.com`; `sub` matches `repo:zkovac-devops/ecr-oci-poc:*` or `repo:zkovac-devops@17102879/ecr-oci-poc@1471640445:*`; max session 1 h |
-| 3 | Inline policy of the role (`terraform-…`) | – | `ecr:GetAuthorizationToken`; push + pull on `poc/*` in eu-central-1; read on `poc/*` in all regions |
-| 4 | ECR repository `poc/apps/poc-app` | eu-central-1 | signed image |
+| 2 | IAM role `gha-ecr-oci-poc` (push) | global | trusts only this OIDC provider; `aud = sts.amazonaws.com`; `sub` must match `<repo prefix>:*:job_workflow_ref:*/.github/workflows/reusable-publish.yml@*` for both `repo:zkovac-devops/ecr-oci-poc` and `repo:zkovac-devops@17102879/ecr-oci-poc@1471640445`; max session 1 h |
+| 3 | Inline policy of the push role (`terraform-…`) | – | `ecr:GetAuthorizationToken`; `ecr:CreateRepository` + push + pull on `poc/*` in eu-central-1; read on `poc/*` in all regions |
+| 3a | IAM role `gha-ecr-oci-poc-pull` + inline policy | global | any job of the repository (`<repo prefix>:*`); read-only on `poc/*` in all regions. Stand-in for `k8s-ecr-pull` |
+| 3b | Repository creation template, prefix `poc`, `applied_for = CREATE_ON_PUSH` | eu-central-1 | `IMMUTABLE_WITH_EXCLUSION` (`sha256-*`), AES256, lifecycle: untagged expire after 14 days |
 | 5 | ECR repository `poc/apps/poc-unsigned` | eu-central-1 | same image without signature (negative test only) |
 | 6 | ECR repository `poc/helm/poc-app` | eu-central-1 | Helm chart (OCI) |
 | 7 | Replication configuration (one per registry) | eu-central-1 | rule: prefix `poc/` → `eu-west-1`, same account |
@@ -58,6 +65,8 @@ Repositories 4–6 share these settings: `IMMUTABLE_WITH_EXCLUSION` with exclusi
 
 | What | Where | Why |
 |---|---|---|
+| Repository `poc/apps/ecr-oci-poc` | eu-central-1 | **created on first push** from the CREATE_ON_PUSH template (name derived from the GitHub repository) |
+| Repository `poc/apps/poc-app` | eu-west-1 | replica from the first run; its primary was removed from Terraform. Delete during cleanup |
 | 3 repositories `poc/...` | **eu-west-1** | created by replication from the creation template. Not in Terraform state, `terraform destroy` does not remove them |
 | Image index + 2 manifests (amd64, arm64), tag `<git sha 12>` | `poc/apps/poc-app` (+ replica) | one set per successful run |
 | Signature tag `sha256-<digest>.sig` | `poc/apps/poc-app`, `poc/helm/poc-app` (+ replicas) | cosign signature copied with `regctl --digest-tags` |
@@ -188,12 +197,15 @@ Workflow: [`.github/workflows/publish-and-verify.yml`](https://github.com/zkovac
 
 ## 5. Findings
 
-1. **GitHub OIDC `sub` can contain immutable IDs.** github.com issued `repo:zkovac-devops@17102879/ecr-oci-poc@1471640445:ref:refs/heads/main` instead of `repo:zkovac-devops/ecr-oci-poc:ref:refs/heads/main`. The trust policy must match the real format. **Action:** print the claims once on GHES before writing the production trust policy.
-2. **AWS Free plan project accounts cannot use ECR.** An AWS-managed SCP denies `ecr:*`. Upgrading and activating advanced features is irreversible; the PoC then ran in the organization's management account, where SCPs do not apply.
-3. **Signatures without Rekor work.** policy-controller skips the transparency log when a `key` authority has no `ctlog`; Flux skips it whenever a public key is used. Confirmed in the sources and end to end.
-4. **Signature tags replicate like any other tag.** ~10 s from Frankfurt to Ireland; the signature verifies in the replica.
-5. **Signatures are per repository.** The same digest in another repository without `.sig` does not verify, so `--digest-tags` (or re-signing) is required for every copy.
-6. **Flux creates the `HelmChart` asynchronously.** Automation must wait for the object to exist before waiting for readiness.
+1. **Reusable workflow trust works.** With the repository OIDC subject template `["repo","context","job_workflow_ref"]`, `sub` was `repo:zkovac-devops@17102879/ecr-oci-poc@1471640445:ref:refs/heads/main:job_workflow_ref:zkovac-devops/ecr-oci-poc/.github/workflows/reusable-publish.yml@refs/heads/main`. The API `GET …/actions/oidc/customization/sub` also returns `use_immutable_subject` and the exact `sub_claim_prefix`, which is the quickest way to learn the format before writing a trust policy.
+
+2. **GitHub OIDC `sub` can contain immutable IDs.** github.com issued `repo:zkovac-devops@17102879/ecr-oci-poc@1471640445:ref:refs/heads/main` instead of `repo:zkovac-devops/ecr-oci-poc:ref:refs/heads/main`. The trust policy must match the real format. **Action:** print the claims once on GHES before writing the production trust policy.
+3. **AWS Free plan project accounts cannot use ECR.** An AWS-managed SCP denies `ecr:*`. Upgrading and activating advanced features is irreversible; the PoC then ran in the organization's management account, where SCPs do not apply.
+4. **Signatures without Rekor work.** policy-controller skips the transparency log when a `key` authority has no `ctlog`; Flux skips it whenever a public key is used. Confirmed in the sources and end to end.
+5. **Signature tags replicate like any other tag.** ~10 s from Frankfurt to Ireland; the signature verifies in the replica.
+6. **Signatures are per repository.** The same digest in another repository without `.sig` does not verify, so `--digest-tags` (or re-signing) is required for every copy.
+7. **Flux creates the `HelmChart` asynchronously.** Automation must wait for the object to exist before waiting for readiness.
+8. **policy-controller webhook needs a moment after `helm install --wait`.** Applying a `ClusterImagePolicy` immediately can fail with `failed calling webhook`; retry until it succeeds.
 
 ## 6. Not covered, to test on Gardener
 
@@ -211,8 +223,14 @@ In CloudShell of account `724875924481`:
 cd ~/ecr-oci-poc/terraform && terraform destroy
 ```
 
+`poc/apps/ecr-oci-poc` in eu-central-1 was created on push and is not in Terraform state:
+
 ```bash
-for r in poc/apps/poc-app poc/apps/poc-unsigned poc/helm/poc-app; do aws ecr delete-repository --region eu-west-1 --repository-name "$r" --force; done
+aws ecr delete-repository --region eu-central-1 --repository-name poc/apps/ecr-oci-poc --force
+```
+
+```bash
+for r in poc/apps/poc-app poc/apps/ecr-oci-poc poc/apps/poc-unsigned poc/helm/poc-app; do aws ecr delete-repository --region eu-west-1 --repository-name "$r" --force; done
 ```
 
 Packages in ghcr.io: GitHub profile → Packages → delete `ecr-oci-poc/*`.
