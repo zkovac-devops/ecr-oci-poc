@@ -668,7 +668,9 @@ resource "aws_ecr_repository_creation_template" "create_on_push" {
 | 4 | Pilot on 2–3 repositories: check `sub`, create-on-push and replication |
 | 5 | Default `publish-ecr: true`, bulk bump of the workflow version (+ `id-token: write` where missing) |
 
-> **PoC:** tested in `zkovac-devops/ecr-oci-poc` with a repository-level subject template, see the [PoC report](../ecr-oci-poc-report/).
+> **Tip:** `gh api …/actions/oidc/customization/sub` (org or repo) also returns `use_immutable_subject` and the exact `sub_claim_prefix`. Read it before writing the trust policy.
+
+> **PoC:** passed in `zkovac-devops/ecr-oci-poc` with a repository-level subject template: only the reusable workflow got the push role, a job outside it was denied, and `poc/apps/ecr-oci-poc` was created on first push with the template settings. See the [PoC report](../ecr-oci-poc-report/).
 
 ## 5. Kubernetes (Gardener shoots)
 
